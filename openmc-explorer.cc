@@ -235,6 +235,9 @@ class Camera
   // Compute direction cosines
   void computeDir();
 
+  // Colors of the materials. Randomized...
+  std::vector<openmc::RGBColor> colors;
+
   bool isRendering_;
   
   unsigned line_index;
@@ -253,7 +256,7 @@ class Camera
     // Start the rendering process
     void beginRendering();
     bool isRendering();
-    void renderlines(Renderer& rend, ExplorerSettings& sett, std::vector<openmc::RGBColor>& colors);
+    void renderlines(Renderer& rend, ExplorerSettings& sett);
 
     void toggleFullscreen() {
       window.toggleFullscreen();
@@ -265,6 +268,8 @@ class Camera
     void increment_roll(double angle_d);
     void increment_fov_horiz(double angle_d);
     void increment_fov_vert(double angle_d);
+
+    void randomizeColors();
 
     // Scoot in a Cartesian direction
     template<unsigned Dir>
@@ -286,6 +291,13 @@ void Camera::computeDir() {
   dir = result;
 }
 
+void Camera::randomizeColors() {
+  for (unsigned n=0; n<openmc::model::materials.size(); ++n) {
+    colors[n] = openmc::random_color();
+  }
+  viewChanged_ = true;
+}
+
 Camera::Camera(double x, double y, double z, double phid, double mud,
     WindowManager& win) : pos(x, y, z),
   fov_x(135.0*M_PI/180.),
@@ -293,9 +305,18 @@ Camera::Camera(double x, double y, double z, double phid, double mud,
   phi(phid * M_PI/180.0),
   mu(mud * M_PI/180.0),
   roll(0.0),
-  window(win)
+  window(win),
+  viewChanged_(true)
 {
   computeDir();
+
+  unsigned n_materials = openmc::model::materials.size();
+  if (n_materials == 0) openmc::fatal_error("No materials found in problem!");
+
+  // Create random colors for materials (need to make sure these have lightness=0.5!
+  for (unsigned m=0; m<n_materials; ++m) {
+    colors.push_back(openmc::random_color());
+  }
 }
 Camera::Camera(WindowManager& win) : Camera(30.0, 30.0, 30.0, 225.0, 135.0, win) {}
 
@@ -342,7 +363,7 @@ void Camera::beginRendering() {
   isRendering_ = true;
   line_index = 0;
 }
-void Camera::renderlines(Renderer& rend, ExplorerSettings& sett, std::vector<openmc::RGBColor>& colors) {
+void Camera::renderlines(Renderer& rend, ExplorerSettings& sett) {
   constexpr unsigned max_intersections = 1000000;
   double half_mu = fov_y/2.;
   double half_phi = fov_x/2.;
@@ -426,25 +447,24 @@ void Camera::renderlines(Renderer& rend, ExplorerSettings& sett, std::vector<ope
         // Convert track lengths to attenuation values
         double overall_product = 1.0;
         for (int mi=0; mi<colors.size(); ++mi) {
-          materials_tracks[mi] = exp(-.01*materials_tracks[mi]);
+          materials_tracks[mi] = exp(-.1*materials_tracks[mi]);
           overall_product *= materials_tracks[mi];
         }
 
         std::array<double, 3> final_color;
-        for (int ci=0; ci<3; ++ci) final_color[ci] = 0.0;
-        for (int ci=0; ci<3; ++ci) { // rgb indices
-          for (int mi=0; mi<colors.size(); ++mi) { // materials
-            // This operation just feels right. It maintains
-            // the expected attenuation of color in limiting
-            // cases, and maintains boundedness always. No indexing
-            // into openmc::RGBColor right now so this is manually unrolled.
-            final_color[0] += (1.0-materials_tracks[mi]) * colors[mi].red *
-              overall_product / materials_tracks[mi];
-            final_color[1] += (1.0-materials_tracks[mi]) * colors[mi].green *
-              overall_product / materials_tracks[mi];
-            final_color[2] += (1.0-materials_tracks[mi]) * colors[mi].blue *
-              overall_product / materials_tracks[mi];
-          }
+        for (int ci=0; ci<3; ++ci) final_color[ci] = 0.0; // zero out stuff
+
+        for (int mi=0; mi<colors.size(); ++mi) { // materials
+          // This operation just feels right. It maintains
+          // the expected attenuation of color in limiting
+          // cases, and maintains boundedness always. No indexing
+          // into openmc::RGBColor right now so this is manually unrolled.
+          final_color[0] += (1.0-materials_tracks[mi]) * colors[mi].red *
+            overall_product / materials_tracks[mi];
+          final_color[1] += (1.0-materials_tracks[mi]) * colors[mi].green *
+            overall_product / materials_tracks[mi];
+          final_color[2] += (1.0-materials_tracks[mi]) * colors[mi].blue *
+            overall_product / materials_tracks[mi];
         }
 
         SDL_SetRenderDrawColor(rend.rend(),
@@ -529,6 +549,10 @@ void handle_events(Camera& cam, ExplorerSettings& sett) {
           case SDLK_F11:
             cam.toggleFullscreen();
             break;
+
+          case SDLK_c:
+            cam.randomizeColors();
+            break;
         }
         break;
     }
@@ -540,9 +564,6 @@ int main(int argc, char** argv)
   ExplorerSettings settings;
   WindowManager window(settings);
   Renderer renderer(window);
-  Camera cam(window);
-
-  std::array<unsigned char, 3> loading_color;
 
   // Set up openmc
   int err;
@@ -550,21 +571,17 @@ int main(int argc, char** argv)
   if (err == -1) { return 0; }
   else if (err) { openmc::fatal_error(openmc_err_msg); }
 
-  // Create random colors for materials
-  std::vector<openmc::RGBColor> colors;
-  // for (unsigned m=0; m<openmc::model::materials.size(); ++m) {
-  //   colors.push_back(openmc::random_color());
-  // }
-  colors.push_back(openmc::RGBColor(255, 0, 0));
-  colors.push_back(openmc::RGBColor(0, 255, 0));
-  colors.push_back(openmc::RGBColor(0, 0, 255));
+  // Camera must be constructed after openmc_init
+  Camera cam(window);
+  cam.beginRendering();
 
+  std::array<unsigned char, 3> loading_color;
   while (settings.running) {
     handle_events(cam, settings);
 
     if (cam.viewChanged() || cam.isRendering()) {
-      if (not cam.isRendering()) cam.beginRendering();
-      cam.renderlines(renderer, settings, colors);
+      if (not cam.isRendering() || (cam.isRendering() && cam.viewChanged())) cam.beginRendering();
+      cam.renderlines(renderer, settings);
 
       loading_color[0] = 240;
       loading_color[1] = 0;
