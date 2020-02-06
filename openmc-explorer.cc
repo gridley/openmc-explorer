@@ -3,8 +3,10 @@
 #include <openmc/cell.h>
 #include <openmc/error.h>
 #include <openmc/geometry.h>
+#include <openmc/material.h>
 #include <openmc/math_functions.h>
 #include <openmc/particle.h>
+#include <openmc/plot.h>
 #include <openmc/position.h>
 
 #include <array>
@@ -12,12 +14,25 @@
 #include <cstdlib>
 #include <iostream>
 #include <string>
+#include <vector>
 
 /* TODO
   - Use timers to steady the scrolling rate
-  - Make TraceableGeometry into an abstract base class
-    that defines how Monte Carlo codes should integrate
-    with this program
+
+  - Define an abstract base class that defines how MC code
+    can interact with this program.
+
+  - Make the distance_to_boundary_from_void work faster. Just need
+    to build the list of surfaces that bound the root universe, rather
+    than looping over cells in the root universe.
+
+  - Make camera move in alignment with the current direction, not
+    just with xyz when pressing wasd.
+
+  - Add capability to press F5 to view current position, orientation, etc.
+
+  - Add atomic operations where needed to remove weird fuzzy effects when
+    using OpenMP
 */
 
 std::array<unsigned char, 3> hsv2rgb(float h, float s, float l) {
@@ -87,9 +102,17 @@ struct ExplorerSettings
   ExplorerSettings();
 };
 ExplorerSettings::ExplorerSettings() : running(true), delta_angle(5.0), delta_scoot(1.0),
-  n_lines_to_draw(50), window_size_x(ExplorerSettings::default_win_size_x),
+  n_lines_to_draw(5), window_size_x(ExplorerSettings::default_win_size_x),
   window_size_y(ExplorerSettings::default_win_size_y), n_threads(1),
-  use_fullscreen(false) {}
+  use_fullscreen(false) 
+{
+#ifdef _OPENMP
+  n_threads = omp_get_max_threads();
+  omp_set_num_threads(n_threads);
+  n_lines_to_draw = n_threads;
+  std::cout << "Ray tracing with " << n_threads << " threads." << std::endl;
+#endif
+}
 
 class WindowManager
 {
@@ -230,9 +253,12 @@ class Camera
     // Start the rendering process
     void beginRendering();
     bool isRendering();
-    void renderlines(Renderer& rend, ExplorerSettings& sett);
+    void renderlines(Renderer& rend, ExplorerSettings& sett, std::vector<openmc::RGBColor>& colors);
 
-    void toggleFullscreen() { window.toggleFullscreen(); }
+    void toggleFullscreen() {
+      window.toggleFullscreen();
+      viewChanged_ = true;
+    }
 
     void rotatePhi(double angle_d);
     void rotateMu(double angle_d);
@@ -271,7 +297,7 @@ Camera::Camera(double x, double y, double z, double phid, double mud,
 {
   computeDir();
 }
-Camera::Camera(WindowManager& win) : Camera(50.0, 50.0, 50.0, 225.0, 135.0, win) {}
+Camera::Camera(WindowManager& win) : Camera(30.0, 30.0, 30.0, 225.0, 135.0, win) {}
 
 void Camera::rotatePhi(double angle_d) {
   double angle_r = angle_d * M_PI/180.0;
@@ -280,9 +306,7 @@ void Camera::rotatePhi(double angle_d) {
   if (phi < 0.0) phi += 2.*M_PI;
   else if (phi > 2.*M_PI) phi -= 2.*M_PI;
 
-  std::cout << "phi = " << phi << std::endl;
   computeDir();
-  std::cout << "phi = " << phi << std::endl;
   viewChanged_ = true;
 }
 
@@ -294,7 +318,6 @@ void Camera::rotateMu(double angle_d) {
   if (mu < 0.0) mu = 0.;
   else if (mu > M_PI) mu = M_PI;
 
-  std::cout << "mu = " << mu << std::endl;
   computeDir();
   viewChanged_ = true;
 }
@@ -319,7 +342,7 @@ void Camera::beginRendering() {
   isRendering_ = true;
   line_index = 0;
 }
-void Camera::renderlines(Renderer& rend, ExplorerSettings& sett) {
+void Camera::renderlines(Renderer& rend, ExplorerSettings& sett, std::vector<openmc::RGBColor>& colors) {
   constexpr unsigned max_intersections = 1000000;
   double half_mu = fov_y/2.;
   double half_phi = fov_x/2.;
@@ -350,11 +373,17 @@ void Camera::renderlines(Renderer& rend, ExplorerSettings& sett) {
       }
 
       // Loop over horizontal pixels
+      // Need to track distance through each material
+      std::vector<double> materials_tracks(colors.size(), 0.0);
       for (unsigned horiz_indx=0; horiz_indx<sett.window_size_x; horiz_indx++) {
 
+        // Reset material tracks to zero
+        for (int mi=0; mi<colors.size(); ++mi)
+          materials_tracks[mi] = 0.0;
+
         // Roll is not currently handled... shouldn't be too hard to add?
-        double phi_t = d_phi*horiz_indx - half_phi;
-        double mu_t = half_mu - d_mu*vert_indx;
+        double phi_t = d_phi*horiz_indx - half_phi + phi;
+        double mu_t = half_mu - d_mu*vert_indx + mu;
         thisdir[0] = cos(phi_t) * sin(mu_t);
         thisdir[1] = sin(phi_t) * sin(mu_t);
         thisdir[2] = cos(mu_t);
@@ -363,8 +392,8 @@ void Camera::renderlines(Renderer& rend, ExplorerSettings& sett) {
         thisbank.u = thisdir;
         part.from_source(&thisbank);
 
-        bool intersection_found = true;
         bool hitsomething = false;
+        bool intersection_found = true;
         unsigned n_loops = 0;
         while (intersection_found) {
           bool inside_cell = openmc::find_cell(&part, false);
@@ -373,10 +402,7 @@ void Camera::renderlines(Renderer& rend, ExplorerSettings& sett) {
             hitsomething = true;
             intersection_found = true;
             auto dist = openmc::distance_to_boundary(&part);
-
-            // Track the color of the ray so far (TODO)
-
-            if (dist.distance == INFINITY) break;
+            materials_tracks.at(part.material_) += dist.distance;
 
             // Advance particle
             for (int lev=0; lev<part.n_coord_; ++lev) {
@@ -391,8 +417,41 @@ void Camera::renderlines(Renderer& rend, ExplorerSettings& sett) {
           if (n_loops > max_intersections) openmc::fatal_error("Infinite loop in tracking!\n");
         }
 
-        unsigned char c = 1;
-        SDL_SetRenderDrawColor(rend.rend(), c, c, c, 255);
+        // TODO the color calculation here is a bit ad hoc. It just
+        // linearly mixes colors based on pathlength through material,
+        // which is clearly bad. More consideration should be given to
+        // which material had been passed through first. Unable to come
+        // up with a good way to handle this at the moment.
+
+        // Convert track lengths to attenuation values
+        double overall_product = 1.0;
+        for (int mi=0; mi<colors.size(); ++mi) {
+          materials_tracks[mi] = exp(-.01*materials_tracks[mi]);
+          overall_product *= materials_tracks[mi];
+        }
+
+        std::array<double, 3> final_color;
+        for (int ci=0; ci<3; ++ci) final_color[ci] = 0.0;
+        for (int ci=0; ci<3; ++ci) { // rgb indices
+          for (int mi=0; mi<colors.size(); ++mi) { // materials
+            // This operation just feels right. It maintains
+            // the expected attenuation of color in limiting
+            // cases, and maintains boundedness always. No indexing
+            // into openmc::RGBColor right now so this is manually unrolled.
+            final_color[0] += (1.0-materials_tracks[mi]) * colors[mi].red *
+              overall_product / materials_tracks[mi];
+            final_color[1] += (1.0-materials_tracks[mi]) * colors[mi].green *
+              overall_product / materials_tracks[mi];
+            final_color[2] += (1.0-materials_tracks[mi]) * colors[mi].blue *
+              overall_product / materials_tracks[mi];
+          }
+        }
+
+        SDL_SetRenderDrawColor(rend.rend(),
+            static_cast<unsigned char>(final_color[0]),
+            static_cast<unsigned char>(final_color[1]),
+            static_cast<unsigned char>(final_color[2]),
+            255);
         SDL_RenderDrawPoint(rend.rend(), horiz_indx, vert_indx);
       }
     }
@@ -483,20 +542,47 @@ int main(int argc, char** argv)
   Renderer renderer(window);
   Camera cam(window);
 
+  std::array<unsigned char, 3> loading_color;
+
   // Set up openmc
   int err;
   err = openmc_init(argc, argv, nullptr);
   if (err == -1) { return 0; }
   else if (err) { openmc::fatal_error(openmc_err_msg); }
 
+  // Create random colors for materials
+  std::vector<openmc::RGBColor> colors;
+  // for (unsigned m=0; m<openmc::model::materials.size(); ++m) {
+  //   colors.push_back(openmc::random_color());
+  // }
+  colors.push_back(openmc::RGBColor(255, 0, 0));
+  colors.push_back(openmc::RGBColor(0, 255, 0));
+  colors.push_back(openmc::RGBColor(0, 0, 255));
+
   while (settings.running) {
     handle_events(cam, settings);
 
-    if (cam.viewChanged() || cam.isRendering())
-    {
+    if (cam.viewChanged() || cam.isRendering()) {
       if (not cam.isRendering()) cam.beginRendering();
-      cam.renderlines(renderer, settings);
+      cam.renderlines(renderer, settings, colors);
+
+      loading_color[0] = 240;
+      loading_color[1] = 0;
+      loading_color[2] = 0;
+    } else {
+      loading_color[0] = 0;
+      loading_color[1] = 240;
+      loading_color[2] = 0;
     }
+
+    // Draw red indicator rectangle for if it's rendering, otherwise green
+    SDL_Rect rect;
+    rect.x = 10;
+    rect.y = 10;
+    rect.w = 10;
+    rect.h = 10;
+    SDL_SetRenderDrawColor(renderer.rend(), loading_color[0], loading_color[1], loading_color[2], 240);
+    SDL_RenderDrawRect(renderer.rend(), &rect);
 
     renderer.present();
   }
