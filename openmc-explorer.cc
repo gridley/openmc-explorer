@@ -344,7 +344,6 @@ void Camera::rotateMu(double angle_d) {
 }
 bool Camera::viewChanged() {
   bool result = viewChanged_;
-  viewChanged_ = false;
   return result;
 }
 void Camera::increment_roll(double angle_d) {
@@ -365,10 +364,10 @@ void Camera::beginRendering() {
 }
 void Camera::renderlines(Renderer& rend, ExplorerSettings& sett) {
   constexpr unsigned max_intersections = 1000000;
-  double half_mu = fov_y/2.;
-  double half_phi = fov_x/2.;
-  double d_mu = fov_y / sett.window_size_y;
-  double d_phi = fov_x / sett.window_size_x;
+  const double half_mu = fov_y/2.;
+  const double half_phi = fov_x/2.;
+  const double d_mu = fov_y / sett.window_size_y;
+  const double d_phi = fov_x / sett.window_size_x;
 
   #pragma omp parallel for
   for (unsigned n=0; n<sett.n_threads; ++n) {
@@ -390,6 +389,7 @@ void Camera::renderlines(Renderer& rend, ExplorerSettings& sett) {
       int vert_indx = n * sett.n_lines_to_draw + l + line_index;
       if (vert_indx >= sett.window_size_y) {
         isRendering_ = false;
+        viewChanged_ = false;
         break;
       }
 
@@ -423,12 +423,22 @@ void Camera::renderlines(Renderer& rend, ExplorerSettings& sett) {
             hitsomething = true;
             intersection_found = true;
             auto dist = openmc::distance_to_boundary(&part);
-            materials_tracks.at(part.material_) += dist.distance;
+            materials_tracks[part.material_] += dist.distance;
 
             // Advance particle
             for (int lev=0; lev<part.n_coord_; ++lev) {
               part.coord_[lev].r += dist.distance * part.coord_[lev].u;
             }
+
+            part.surface_ = dist.surface_index;
+            part.n_coord_ = dist.coord_level;
+            part.n_coord_last_ = part.n_coord_;
+            // if (dist.lattice_translation[0] != 0 ||
+            //     dist.lattice_translation[1] != 0 ||
+            //     dist.lattice_translation[2] != 0) {
+            //   // Particle crosses lattice boundary
+            //   cross_lattice(&part, dist);
+            // }
 
           } else {
             intersection_found = distance_to_boundary_from_void(part);
@@ -467,12 +477,15 @@ void Camera::renderlines(Renderer& rend, ExplorerSettings& sett) {
             overall_product / materials_tracks[mi];
         }
 
-        SDL_SetRenderDrawColor(rend.rend(),
-            static_cast<unsigned char>(final_color[0]),
-            static_cast<unsigned char>(final_color[1]),
-            static_cast<unsigned char>(final_color[2]),
-            255);
-        SDL_RenderDrawPoint(rend.rend(), horiz_indx, vert_indx);
+        #pragma omp critical
+        {
+          SDL_SetRenderDrawColor(rend.rend(),
+              static_cast<unsigned char>(final_color[0]),
+              static_cast<unsigned char>(final_color[1]),
+              static_cast<unsigned char>(final_color[2]),
+              255);
+          SDL_RenderDrawPoint(rend.rend(), horiz_indx, vert_indx);
+        }
       }
     }
   }
@@ -580,7 +593,7 @@ int main(int argc, char** argv)
     handle_events(cam, settings);
 
     if (cam.viewChanged() || cam.isRendering()) {
-      if (not cam.isRendering() || (cam.isRendering() && cam.viewChanged())) cam.beginRendering();
+      if (not cam.isRendering()) cam.beginRendering();
       cam.renderlines(renderer, settings);
 
       loading_color[0] = 240;
