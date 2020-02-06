@@ -1,8 +1,9 @@
 # OpenMC Explorer
 
-This is the simplest of geometry ray tracers, which uses an extremely system of controls, and
+This is the simplest of geometry ray tracers, which uses an extremely (ok?) system of controls, which
 is very hard to use if you're not the author of the code. Of course, these shortcomings will
-eventually improve. For now, here are some of the controls, and a pretty picture.
+eventually improve. For now, here are some of the controls, and a pretty picture. Dare to use
+this tool on your OpenMC input, if you dare.
 
 Control | Action
 --------|------------------------------------------------------
