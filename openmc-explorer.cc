@@ -1,5 +1,6 @@
 #include <SDL2/SDL.h>
 
+#include <openmc/cell.h>
 #include <openmc/error.h>
 #include <openmc/geometry.h>
 #include <openmc/math_functions.h>
@@ -77,7 +78,7 @@ struct ExplorerSettings
 
   // How many lines to draw between frames. This dynamically adjusts to keep
   // a desirable framerate
-  unsigned n_lines_to_draw = 1;
+  unsigned n_lines_to_draw;
   
   int window_size_x;
   int window_size_y;
@@ -85,8 +86,8 @@ struct ExplorerSettings
 
   ExplorerSettings();
 };
-ExplorerSettings::ExplorerSettings() : running(true), delta_angle(5.0), delta_scoot(5.),
-  n_lines_to_draw(5), window_size_x(ExplorerSettings::default_win_size_x),
+ExplorerSettings::ExplorerSettings() : running(true), delta_angle(5.0), delta_scoot(1.0),
+  n_lines_to_draw(50), window_size_x(ExplorerSettings::default_win_size_x),
   window_size_y(ExplorerSettings::default_win_size_y), n_threads(1),
   use_fullscreen(false) {}
 
@@ -163,6 +164,32 @@ Renderer::Renderer(WindowManager& win) : renderer_(nullptr) {
 void Renderer::present() { SDL_RenderPresent(renderer_); }
 Renderer::~Renderer() { SDL_DestroyRenderer(renderer_); }
 
+// Track a particle from outside the OpenMC geometry up to the
+// boundary. Returns true if an OpenMC boundary is intersected.
+bool distance_to_boundary_from_void(openmc::Particle& p) {
+  // Check intersections with surfaces all surfaces used in universe 0
+  constexpr double scoot = 1e-5; // fairly big scoot, because whatever.
+  double min_dist {INFINITY};
+
+  // The root level coordinates are always being used in this case
+  auto coord = p.coord_[0];
+  openmc::Universe* uni = openmc::model::universes.at(openmc::model::root_universe).get();
+  for (auto c_i : uni->cells_) {
+    auto dist = openmc::model::cells.at(c_i)->distance(coord.r, coord.u, 0, &p);
+    if (dist.first < min_dist) min_dist = dist.first;
+  }
+
+  if (min_dist > 1e300) return false;
+  else {
+    // advance
+    // std::cout << min_dist << std::endl;
+    for (int j = 0; j < p.n_coord_; ++j) {
+      p.coord_[j].r += (min_dist+scoot) * p.coord_[j].u;
+    }
+    return true;
+  }
+}
+
 class Camera
 {
   openmc::Position pos;
@@ -174,9 +201,16 @@ class Camera
   // Amount of roll to the camera (radians)
   double roll;
 
-  // Field of view. Initially set to values close to the human eye
+  // Field of view. Initially set to values close to the human eye (radians)
   double fov_x;
   double fov_y;
+
+  // current view angle
+  double phi;
+  double mu;
+
+  // Compute direction cosines
+  void computeDir();
 
   bool isRendering_;
   
@@ -218,31 +252,50 @@ class Camera
 };
 bool Camera::isRendering() { return isRendering_; }
 
-Camera::Camera(double x, double y, double z, double phi, double mu,
-    WindowManager& win) : dir(x, y, z),
+void Camera::computeDir() {
+  openmc::Direction result;
+  result[0] = cos(phi) * sin(mu);
+  result[1] = sin(phi) * sin(mu);
+  result[2] = cos(mu);
+  dir = result;
+}
+
+Camera::Camera(double x, double y, double z, double phid, double mud,
+    WindowManager& win) : pos(x, y, z),
   fov_x(135.0*M_PI/180.),
   fov_y(75.0*M_PI/180.),
+  phi(phid * M_PI/180.0),
+  mu(mud * M_PI/180.0),
   roll(0.0),
   window(win)
 {
-  double phi_rad = phi * M_PI/180.0;
-  double mu_rad = mu * M_PI/180.0;
-  dir.x = cos(phi_rad) * sin(mu_rad);
-  dir.y = sin(phi_rad) * sin(mu_rad);
-  dir.z = cos(mu_rad);
+  computeDir();
 }
-Camera::Camera(WindowManager& win) : Camera(100.0, 100.0, 100.0, 225.0, 135.0, win) {}
+Camera::Camera(WindowManager& win) : Camera(50.0, 50.0, 50.0, 225.0, 135.0, win) {}
 
 void Camera::rotatePhi(double angle_d) {
   double angle_r = angle_d * M_PI/180.0;
-  dir = openmc::rotate_angle(dir, 0.0, &angle_r, nullptr);
+  phi += angle_r;
+
+  if (phi < 0.0) phi += 2.*M_PI;
+  else if (phi > 2.*M_PI) phi -= 2.*M_PI;
+
+  std::cout << "phi = " << phi << std::endl;
+  computeDir();
+  std::cout << "phi = " << phi << std::endl;
   viewChanged_ = true;
 }
 
 void Camera::rotateMu(double angle_d) {
   double phi_zero = 0.0;
   double angle_r = angle_d * M_PI/180.;
-  dir = openmc::rotate_angle(dir, angle_r, &phi_zero, nullptr);
+  mu += angle_r;
+
+  if (mu < 0.0) mu = 0.;
+  else if (mu > M_PI) mu = M_PI;
+
+  std::cout << "mu = " << mu << std::endl;
+  computeDir();
   viewChanged_ = true;
 }
 bool Camera::viewChanged() {
@@ -267,6 +320,7 @@ void Camera::beginRendering() {
   line_index = 0;
 }
 void Camera::renderlines(Renderer& rend, ExplorerSettings& sett) {
+  constexpr unsigned max_intersections = 1000000;
   double half_mu = fov_y/2.;
   double half_phi = fov_x/2.;
   double d_mu = fov_y / sett.window_size_y;
@@ -284,6 +338,7 @@ void Camera::renderlines(Renderer& rend, ExplorerSettings& sett) {
     thisbank.particle = openmc::Particle::Type::photon; //why not?
     thisbank.parent_id = 1;
     thisbank.progeny_id = 2;
+    thisbank.r = pos;
 
     // Loop over lines per thread to draw
     for (unsigned l=0; l<sett.n_lines_to_draw; ++l) {
@@ -298,29 +353,46 @@ void Camera::renderlines(Renderer& rend, ExplorerSettings& sett) {
       for (unsigned horiz_indx=0; horiz_indx<sett.window_size_x; horiz_indx++) {
 
         // Roll is not currently handled... shouldn't be too hard to add?
-        double phi = d_phi*horiz_indx - half_phi;
-        double mu = half_mu - d_mu*vert_indx;
-        thisdir = openmc::rotate_angle(dir, mu, &phi, nullptr);
+        double phi_t = d_phi*horiz_indx - half_phi;
+        double mu_t = half_mu - d_mu*vert_indx;
+        thisdir[0] = cos(phi_t) * sin(mu_t);
+        thisdir[1] = sin(phi_t) * sin(mu_t);
+        thisdir[2] = cos(mu_t);
 
         // Trace ray through geometry
-        thisbank.r = pos;
         thisbank.u = thisdir;
         part.from_source(&thisbank);
 
-        int cellid = openmc::find_cell(&part, false);
-        auto dist = openmc::distance_to_boundary(&part);
-        bool hitsomething;
-        if (dist.distance == INFINITY) hitsomething = false;
-        else hitsomething = true;
+        bool intersection_found = true;
+        bool hitsomething = false;
+        unsigned n_loops = 0;
+        while (intersection_found) {
+          bool inside_cell = openmc::find_cell(&part, false);
+          if (inside_cell) {
+            // Inside geometry, so normal tracing routines may be used
+            hitsomething = true;
+            intersection_found = true;
+            auto dist = openmc::distance_to_boundary(&part);
 
-        double value = 240.*(1-exp(dist.distance));
-        auto c = static_cast<unsigned char>(value);
-        if (hitsomething) {
-          SDL_SetRenderDrawColor(rend.rend(), c, c, c, 255);
+            // Track the color of the ray so far (TODO)
+
+            if (dist.distance == INFINITY) break;
+
+            // Advance particle
+            for (int lev=0; lev<part.n_coord_; ++lev) {
+              part.coord_[lev].r += dist.distance * part.coord_[lev].u;
+            }
+
+          } else {
+            intersection_found = distance_to_boundary_from_void(part);
+          }
+          n_loops++;
+
+          if (n_loops > max_intersections) openmc::fatal_error("Infinite loop in tracking!\n");
         }
-        else
-          SDL_SetRenderDrawColor(rend.rend(), 0, 0, 0, 0);
 
+        unsigned char c = 1;
+        SDL_SetRenderDrawColor(rend.rend(), c, c, c, 255);
         SDL_RenderDrawPoint(rend.rend(), horiz_indx, vert_indx);
       }
     }
@@ -403,7 +475,6 @@ void handle_events(Camera& cam, ExplorerSettings& sett) {
     }
   }
 }
-
 
 int main(int argc, char** argv)
 {
