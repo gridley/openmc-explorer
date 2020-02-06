@@ -1,6 +1,7 @@
 #include <SDL2/SDL.h>
 
 #include <openmc/cell.h>
+#include <openmc/constants.h>
 #include <openmc/error.h>
 #include <openmc/geometry.h>
 #include <openmc/material.h>
@@ -33,6 +34,11 @@
 
   - Add atomic operations where needed to remove weird fuzzy effects when
     using OpenMP
+
+  - Currently causes a segfault if openmc loses a particle. This happens
+    when particles perfectly intersect the corner of a Cartesian lattice
+    at 45 deg to the corner. If the camera is slightly adjusted, the error
+    does not happen.
 */
 
 std::array<unsigned char, 3> hsv2rgb(float h, float s, float l) {
@@ -196,7 +202,7 @@ bool distance_to_boundary_from_void(openmc::Particle& p) {
 
   // The root level coordinates are always being used in this case
   auto coord = p.coord_[0];
-  openmc::Universe* uni = openmc::model::universes.at(openmc::model::root_universe).get();
+  openmc::Universe* uni = openmc::model::universes[openmc::model::root_universe].get();
   for (auto c_i : uni->cells_) {
     auto dist = openmc::model::cells.at(c_i)->distance(coord.r, coord.u, 0, &p);
     if (dist.first < min_dist) min_dist = dist.first;
@@ -231,6 +237,9 @@ class Camera
   // current view angle
   double phi;
   double mu;
+
+  // How transpartent the geometry is
+  double opacity;
 
   // Compute direction cosines
   void computeDir();
@@ -268,6 +277,7 @@ class Camera
     void increment_roll(double angle_d);
     void increment_fov_horiz(double angle_d);
     void increment_fov_vert(double angle_d);
+    void increment_opacity(double d_opac);
 
     void randomizeColors();
 
@@ -283,6 +293,11 @@ class Camera
 };
 bool Camera::isRendering() { return isRendering_; }
 
+void Camera::increment_opacity(double d_opac) {
+  opacity += d_opac;
+  if (opacity < 0) opacity = .00001;
+  viewChanged_ = true;
+}
 void Camera::computeDir() {
   openmc::Direction result;
   result[0] = cos(phi) * sin(mu);
@@ -306,7 +321,8 @@ Camera::Camera(double x, double y, double z, double phid, double mud,
   mu(mud * M_PI/180.0),
   roll(0.0),
   window(win),
-  viewChanged_(true)
+  viewChanged_(true),
+  opacity(.001)
 {
   computeDir();
 
@@ -318,7 +334,7 @@ Camera::Camera(double x, double y, double z, double phid, double mud,
     colors.push_back(openmc::random_color());
   }
 }
-Camera::Camera(WindowManager& win) : Camera(30.0, 30.0, 30.0, 225.0, 135.0, win) {}
+Camera::Camera(WindowManager& win) : Camera(-500, -501, 0.0, 45.0, 90.0, win) {}
 
 void Camera::rotatePhi(double angle_d) {
   double angle_r = angle_d * M_PI/180.0;
@@ -413,6 +429,10 @@ void Camera::renderlines(Renderer& rend, ExplorerSettings& sett) {
         thisbank.u = thisdir;
         part.from_source(&thisbank);
 
+        #ifdef DEBUG
+        std::cout << "New particle" << std::endl;
+        #endif
+
         bool hitsomething = false;
         bool intersection_found = true;
         unsigned n_loops = 0;
@@ -430,15 +450,19 @@ void Camera::renderlines(Renderer& rend, ExplorerSettings& sett) {
               part.coord_[lev].r += dist.distance * part.coord_[lev].u;
             }
 
+            #ifdef DEBUG
+            std::cout << part.coord_[0].r << std::endl;
+            #endif
+
             part.surface_ = dist.surface_index;
             part.n_coord_ = dist.coord_level;
             part.n_coord_last_ = part.n_coord_;
-            // if (dist.lattice_translation[0] != 0 ||
-            //     dist.lattice_translation[1] != 0 ||
-            //     dist.lattice_translation[2] != 0) {
-            //   // Particle crosses lattice boundary
-            //   cross_lattice(&part, dist);
-            // }
+            if (dist.lattice_translation[0] != 0 ||
+                dist.lattice_translation[1] != 0 ||
+                dist.lattice_translation[2] != 0) {
+              // Particle crosses lattice boundary
+              cross_lattice(&part, dist);
+            }
 
           } else {
             intersection_found = distance_to_boundary_from_void(part);
@@ -457,7 +481,7 @@ void Camera::renderlines(Renderer& rend, ExplorerSettings& sett) {
         // Convert track lengths to attenuation values
         double overall_product = 1.0;
         for (int mi=0; mi<colors.size(); ++mi) {
-          materials_tracks[mi] = exp(-.1*materials_tracks[mi]);
+          materials_tracks[mi] = exp(-opacity*materials_tracks[mi]);
           overall_product *= materials_tracks[mi];
         }
 
@@ -559,6 +583,14 @@ void handle_events(Camera& cam, ExplorerSettings& sett) {
             cam.increment_fov_vert(-sett.delta_angle);
             break;
 
+          // Material opacity adjustment
+          case SDLK_j:
+            cam.increment_opacity(-.0001);
+            break;
+          case SDLK_k:
+            cam.increment_opacity(.0001);
+            break;
+
           case SDLK_F11:
             cam.toggleFullscreen();
             break;
@@ -587,6 +619,13 @@ int main(int argc, char** argv)
   // Camera must be constructed after openmc_init
   Camera cam(window);
   cam.beginRendering();
+
+  // Get geometry bounding box, and move camera so all is initially visible
+  auto bBox = openmc::model::universes[openmc::model::root_universe]->bounding_box();
+  std::cout << "Model bounding box is:" << std::endl;
+  std::cout << "x: " << bBox.xmin << " " << bBox.xmax << std::endl;
+  std::cout << "x: " << bBox.ymin << " " << bBox.ymax << std::endl;
+  std::cout << "x: " << bBox.zmin << " " << bBox.zmax << std::endl;
 
   std::array<unsigned char, 3> loading_color;
   while (settings.running) {
