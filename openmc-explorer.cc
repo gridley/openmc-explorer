@@ -39,6 +39,12 @@
     when particles perfectly intersect the corner of a Cartesian lattice
     at 45 deg to the corner. If the camera is slightly adjusted, the error
     does not happen.
+
+  - Add superimposition of an OpenGL-based cross at the origin, along with
+    and OpenGL-based bounding box of the geometry. These can be displayed
+    while the camera is being oriented and disappear when rendering is complete.
+    This would help the user not lose their orientation when moving the camera,
+    sort of like in Paraview when doing volume rendering.
 */
 
 std::array<unsigned char, 3> hsv2rgb(float h, float s, float l) {
