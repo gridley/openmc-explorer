@@ -47,6 +47,13 @@
     sort of like in Paraview when doing volume rendering.
 */
 
+// Identifiers for different Cartesian axes
+enum class CartAxis {
+  x,
+  y,
+  z
+};
+
 std::array<unsigned char, 3> hsv2rgb(float h, float s, float l) {
   std::array<unsigned char,3> result;
   std::array<float,3> resultf;
@@ -227,6 +234,11 @@ bool distance_to_boundary_from_void(openmc::Particle& p) {
 
 class Camera
 {
+  // This is the additional margin to place the model at
+  // the right distance. 0 corresponds to having the model
+  // perfectly touch the edge of the screen.
+  static constexpr double angle_margin = 15.0 * M_PI / 180.0;
+
   openmc::Position pos;
   openmc::Direction dir;
 
@@ -268,15 +280,26 @@ class Camera
     // Phi and mu are given in degrees here:
     Camera(double x, double y, double z, double phi, double mu, WindowManager& win);
 
+    // position setter
+    void setPosition(double x, double y, double z);
+    void setAngle_radians(double phi, double mu);
+    void setAngle_degrees(double phi, double mu);
+
     // Start the rendering process
     void beginRendering();
     bool isRendering();
     void renderlines(Renderer& rend, ExplorerSettings& sett);
 
+    // Prompt user for new opacity
+    void terminalSetOpacity();
+
     void toggleFullscreen() {
       window.toggleFullscreen();
       viewChanged_ = true;
     }
+
+    void printPosition();
+    void printAngle();
 
     void rotatePhi(double angle_d);
     void rotateMu(double angle_d);
@@ -286,6 +309,13 @@ class Camera
     void increment_opacity(double d_opac);
 
     void randomizeColors();
+
+    // Automatically place camera so that model is fully in view
+    template<CartAxis ax>
+    void autoPlace(openmc::BoundingBox box) {
+      // Error if template specialization not found
+      openmc::fatal_error("Unknown cartesian axis in camera auto-placement.");
+    }
 
     // Scoot in a Cartesian direction
     template<unsigned Dir>
@@ -297,6 +327,65 @@ class Camera
     // Check whether view has been changed (resets internal state after checking)
     bool viewChanged();
 };
+
+void Camera::terminalSetOpacity() {
+  std::cout << "Please enter a new opacity for the model (cm^-1)" << std::endl;
+  std::cin >> opacity;
+  viewChanged_ = true;
+}
+
+void Camera::printPosition() {
+  std::cout << "Camera position:" << std::endl;
+  std::cout << "----------------" << std::endl;
+  std::cout << "x = " << pos[0] << " cm" << std::endl;
+  std::cout << "y = " << pos[1] << " cm" << std::endl;
+  std::cout << "z = " << pos[2] << " cm" << std::endl;
+}
+void Camera::printAngle() {
+  std::cout << "Camera angle:" << std::endl;
+  std::cout << "----------------" << std::endl;
+  std::cout << "phi = " << phi*180./M_PI << " deg" << std::endl;
+  std::cout << "phi = " << mu*180./M_PI << " deg" << std::endl;
+}
+
+void Camera::setPosition(double x, double y, double z) {
+  pos[0] = x; pos[1] = y; pos[2] = z; viewChanged_ = true;
+}
+void Camera::setAngle_radians(double phi, double mu) {
+  this->phi = phi;
+  this->mu = mu;
+  computeDir();
+}
+void Camera::setAngle_degrees(double phi, double mu) {
+  this->phi = phi * M_PI/180.0;
+  this->mu= mu * M_PI/180.0;
+  computeDir();
+}
+
+template<>
+void Camera::autoPlace<CartAxis::x>(openmc::BoundingBox box) {
+  double pos1 = fmax(box.xmin, box.xmax) / atan(fov_x/2-Camera::angle_margin);
+  double pos2 = fmax(box.zmin, box.zmax) / atan(fov_y/2-Camera::angle_margin);
+  setPosition(fmax(pos1, pos2), 0., 0.);
+  setAngle_degrees(180.0, 90.0);
+}
+template<>
+void Camera::autoPlace<CartAxis::y>(openmc::BoundingBox box) {
+  double pos1 = fmax(box.ymin, box.ymax) / atan(fov_x/2-Camera::angle_margin);
+  double pos2 = fmax(box.zmin, box.zmax) / atan(fov_y/2-Camera::angle_margin);
+  setPosition(0., fmax(pos1, pos2), 0.);
+  setAngle_degrees(90.0, 90.0);
+}
+template<>
+void Camera::autoPlace<CartAxis::z>(openmc::BoundingBox box) {
+  openmc::fatal_error("z axis acting funky right now...\n");
+  // TODO
+  // double pos1 = fmax(box.xmin, box.ymax) / (2.0 * atan(fov_x/2+Camera::angle_margin));
+  // double pos2 = fmax(box.zmin, box.zmax) / (2.0 * atan(fov_y/2+Camera::angle_margin));
+  // setPosition(0., fmax(pos1, pos2), 0.);
+  // setAngle_degrees(90.0, 0.0);
+}
+
 bool Camera::isRendering() { return isRendering_; }
 
 void Camera::increment_opacity(double d_opac) {
@@ -514,7 +603,8 @@ void Camera::renderlines(Renderer& rend, ExplorerSettings& sett) {
               static_cast<unsigned char>(final_color[1]),
               static_cast<unsigned char>(final_color[2]),
               255);
-          SDL_RenderDrawPoint(rend.rend(), horiz_indx, vert_indx);
+          // NOTE: screen coordinates are upside-down.
+          SDL_RenderDrawPoint(rend.rend(), horiz_indx, sett.window_size_y-1-vert_indx);
         }
       }
     }
@@ -604,6 +694,19 @@ void handle_events(Camera& cam, ExplorerSettings& sett) {
           case SDLK_c:
             cam.randomizeColors();
             break;
+
+          // Prints information about camera orientation
+          case SDLK_p:
+            cam.printPosition();
+            break;
+          case SDLK_v:
+            cam.printAngle();
+            break;
+
+          // Opacity is kinda tough to adjust...
+          case SDLK_o:
+            cam.terminalSetOpacity();
+            break;
         }
         break;
     }
@@ -624,7 +727,6 @@ int main(int argc, char** argv)
 
   // Camera must be constructed after openmc_init
   Camera cam(window);
-  cam.beginRendering();
 
   // Get geometry bounding box, and move camera so all is initially visible
   auto bBox = openmc::model::universes[openmc::model::root_universe]->bounding_box();
@@ -632,6 +734,10 @@ int main(int argc, char** argv)
   std::cout << "x: " << bBox.xmin << " " << bBox.xmax << std::endl;
   std::cout << "x: " << bBox.ymin << " " << bBox.ymax << std::endl;
   std::cout << "x: " << bBox.zmin << " " << bBox.zmax << std::endl;
+
+  // Place camera along either x, y, or z axis so that the model is fully in view.
+  cam.autoPlace<CartAxis::x>(bBox);
+  cam.beginRendering();
 
   std::array<unsigned char, 3> loading_color;
   while (settings.running) {
