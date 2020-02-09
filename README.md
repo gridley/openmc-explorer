@@ -2,7 +2,7 @@
 
 This is the simplest of geometry ray tracers, which uses an extremely (ok?) system of controls, which
 is very hard to use if you're not the author of the code. Of course, these shortcomings will
-eventually improve. For now, here are some of the controls, and a pretty picture. Dare to use
+eventually improve. For now, here are some of the controls, and a pretty picture. Use
 this tool on your OpenMC input, if you dare.
 
 Control | Action
